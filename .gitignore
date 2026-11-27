@@ -1,4 +1,9 @@
 node_modules/
 .idea/
-
 /.forge/
+dist/
+build/
+.env
+.env.*
+*.log
+.DS_Store
