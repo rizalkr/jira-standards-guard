@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" fill="none">
+  <defs>
+    <linearGradient id="bg-grad" x1="20" y1="16" x2="236" y2="244" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0C66E4" />
+      <stop offset="100%" stop-color="#09326C" />
+    </linearGradient>
+    <radialGradient id="top-glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(56 44) rotate(45) scale(190)">
+      <stop offset="0%" stop-color="#579DFF" stop-opacity="0.42" />
+      <stop offset="100%" stop-color="#0C66E4" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="shield-grad" x1="122" y1="44" x2="122" y2="210" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="100%" stop-color="#E9F2FF" />
+    </linearGradient>
+    <linearGradient id="badge-grad" x1="150" y1="145" x2="198" y2="199" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2ABB7F" />
+      <stop offset="100%" stop-color="#1F845A" />
+    </linearGradient>
+    <clipPath id="tile-clip">
+      <rect x="8" y="8" width="240" height="240" rx="54" />
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#tile-clip)">
+    <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg-grad)" />
+    <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#top-glow)" />
+    <rect x="9" y="9" width="238" height="238" rx="53" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="2" />
+  </g>
+
+  <g transform="translate(0, 6)">
+    <path
+      d="M 122 44 L 186 68 V 124 C 186 164 159 194 122 210 C 85 194 58 164 58 124 V 68 Z"
+      fill="#062452"
+      fill-opacity="0.28"
+    />
+  </g>
+
+  <path
+    d="M 122 44 L 186 68 V 124 C 186 164 159 194 122 210 C 85 194 58 164 58 124 V 68 Z"
+    fill="url(#shield-grad)"
+    stroke="#FFFFFF"
+    stroke-width="2"
+    stroke-linejoin="round"
+  />
+
+  <circle cx="88" cy="96" r="6" fill="#0C66E4" />
+  <rect x="102" y="90" width="54" height="12" rx="6" fill="#0C66E4" />
+
+  <circle cx="88" cy="124" r="6" fill="#2684FF" />
+  <rect x="102" y="118" width="44" height="12" rx="6" fill="#2684FF" />
+
+  <circle cx="88" cy="152" r="6" fill="#579DFF" />
+  <rect x="102" y="146" width="32" height="12" rx="6" fill="#579DFF" />
+
+  <circle cx="174" cy="172" r="40" fill="#093E91" />
+  <circle cx="174" cy="172" r="33" fill="url(#badge-grad)" />
+  <path
+    d="M 158 172 L 169 183 L 191 160"
+    stroke="#FFFFFF"
+    stroke-width="10"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

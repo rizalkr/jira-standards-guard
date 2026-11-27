@@ -7,7 +7,7 @@ modules:
         function: resolver
       viewportSize: medium
       title: Jira Standards Guard
-      icon: https://developer.atlassian.com/platform/forge/images/issue-panel-icon.svg
+      icon: resource:app-icons;logo.svg
   jira:adminPage:
     - key: standards-guard-admin-page
       resource: admin-page-ui
@@ -107,6 +107,8 @@ resources:
     path: src/frontend/issue-panel.jsx
   - key: admin-page-ui
     path: src/frontend/admin-page.jsx
+  - key: app-icons
+    path: static/icons
 permissions:
   scopes:
     - read:jira-work
