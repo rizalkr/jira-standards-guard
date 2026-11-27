@@ -49,13 +49,19 @@ const RULE_STATUS_META = {
   EXEMPTED_PRECEDENT: { appearance: 'inprogress', label: 'EXEMPTED (PRECEDENT)' },
 };
 
+const TWG_STATUS_META = {
+  ok: { appearance: 'success', label: 'CONNECTED' },
+  unavailable: { appearance: 'default', label: 'UNAVAILABLE' },
+  error: { appearance: 'moved', label: 'DEGRADED' },
+};
+
 const IssuePanel = () => {
   const [evaluation, setEvaluation] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [actionBusyId, setActionBusyId] = useState(null);
 
-  const [modalRule, setModalRule] = useState(null);
+  const [modalRules, setModalRules] = useState([]);
   const [reason, setReason] = useState('');
   const [saveAsPrecedent, setSaveAsPrecedent] = useState(true);
   const [patternIssueType, setPatternIssueType] = useState(null);
@@ -84,10 +90,11 @@ const IssuePanel = () => {
     loadEvaluation();
   }, [loadEvaluation]);
 
-  const openApprovalModal = (ruleResult) => {
+  const openApprovalModal = (ruleList) => {
+    const rules = Array.isArray(ruleList) ? ruleList : [ruleList];
     const issueType = evaluation?.issueContext?.issueType || 'Bug';
     const firstLabel = evaluation?.issueContext?.labels?.[0] || '';
-    setModalRule(ruleResult);
+    setModalRules(rules);
     setReason('');
     setSaveAsPrecedent(true);
     setPatternIssueType({ label: `${issueType} only`, value: issueType });
@@ -97,12 +104,12 @@ const IssuePanel = () => {
 
   const closeModal = () => {
     if (submitting) return;
-    setModalRule(null);
+    setModalRules([]);
     setModalError('');
   };
 
   const handleSubmitApproval = async () => {
-    if (!modalRule) return;
+    if (modalRules.length === 0) return;
     const trimmed = reason.trim();
     if (trimmed.length < 5) {
       setModalError('Please enter at least 5 characters explaining why this exception is approved.');
@@ -113,7 +120,7 @@ const IssuePanel = () => {
     setModalError('');
     try {
       const res = await invoke('approveException', {
-        ruleId: modalRule.ruleId,
+        ruleIds: modalRules.map((r) => r.ruleId),
         reason: trimmed,
         scope: saveAsPrecedent ? 'precedent' : 'issue',
         patternIssueType: patternIssueType?.value || evaluation?.issueContext?.issueType || '*',
@@ -124,7 +131,7 @@ const IssuePanel = () => {
         setModalError(res?.error || 'Failed to approve exception.');
       } else {
         setEvaluation(res.evaluation);
-        setModalRule(null);
+        setModalRules([]);
       }
     } catch (err) {
       setModalError(err?.message || 'Unexpected error approving exception.');
@@ -169,12 +176,19 @@ const IssuePanel = () => {
     );
   }
 
-  const { verdict, issueContext, summary, results } = evaluation;
+  const { verdict, issueContext, teamworkGraph, summary, results } = evaluation;
   const verdictMeta = VERDICT_META[verdict] || VERDICT_META.BLOCKED;
+  const failingBlockingRules = results.filter((item) => item.status === 'FAILED');
+  const graphPages = Array.isArray(teamworkGraph?.linkedPages) ? teamworkGraph.linkedPages : [];
+  const graphIssues = Array.isArray(teamworkGraph?.relatedIssues) ? teamworkGraph.relatedIssues : [];
+  const twgMeta = TWG_STATUS_META[teamworkGraph?.status] || TWG_STATUS_META.unavailable;
+
   const totalLinks =
     (issueContext.issueLinksCount || 0) +
     (issueContext.remoteLinksCount || 0) +
-    (issueContext.urls?.length || 0);
+    (issueContext.urls?.length || 0) +
+    (issueContext.graphLinkedPagesCount || 0) +
+    (issueContext.graphRelatedIssuesCount || 0);
   const issueTypeOptions = [
     { label: `${issueContext.issueType} only`, value: issueContext.issueType },
     { label: 'All issue types (*)', value: '*' },
@@ -188,13 +202,23 @@ const IssuePanel = () => {
           <Text weight="bold">{issueContext.key}</Text>
           <Lozenge appearance="default">{issueContext.issueType}</Lozenge>
         </Inline>
-        <LoadingButton
-          appearance="subtle"
-          isLoading={loading}
-          onClick={loadEvaluation}
-        >
-          Re-check
-        </LoadingButton>
+        <Inline space="space.100" alignBlock="center">
+          {failingBlockingRules.length > 1 && (
+            <Button
+              appearance="default"
+              onClick={() => openApprovalModal(failingBlockingRules)}
+            >
+              Approve All Blocking ({failingBlockingRules.length})
+            </Button>
+          )}
+          <LoadingButton
+            appearance="subtle"
+            isLoading={loading}
+            onClick={loadEvaluation}
+          >
+            Re-check
+          </LoadingButton>
+        </Inline>
       </Inline>
 
       <Text size="small" color="color.text.subtle">
@@ -243,7 +267,7 @@ const IssuePanel = () => {
                   {isFailing && (
                     <Button
                       appearance="subtle"
-                      onClick={() => openApprovalModal(item)}
+                      onClick={() => openApprovalModal([item])}
                     >
                       Approve Exception
                     </Button>
@@ -288,19 +312,84 @@ const IssuePanel = () => {
         })}
       </Stack>
 
+      <Box
+        backgroundColor="elevation.surface.sunken"
+        padding="space.150"
+        xcss={cardStyle}
+      >
+        <Stack space="space.075">
+          <Inline spread="space-between" alignBlock="center">
+            <Text weight="bold">Teamwork Graph Context</Text>
+            <Lozenge appearance={twgMeta.appearance}>{twgMeta.label}</Lozenge>
+          </Inline>
+
+          <Text size="small" color="color.text.subtle">
+            Connected Confluence Pages: {graphPages.length} | Related Jira Issues:{' '}
+            {graphIssues.length}
+          </Text>
+
+          {graphPages.map((page) => (
+            <Text key={page.id || page.url || page.title} size="small">
+              Page:{' '}
+              {page.url ? (
+                <Link href={page.url} openNewTab>
+                  {page.title}
+                </Link>
+              ) : (
+                page.title
+              )}
+            </Text>
+          ))}
+
+          {graphIssues.map((rel) => (
+            <Text key={rel.key || rel.id} size="small">
+              Issue: {rel.key}
+              {rel.summary ? ` — ${rel.summary}` : ''}
+              {rel.status ? ` (${rel.status})` : ''}
+            </Text>
+          ))}
+
+          {graphPages.length === 0 && graphIssues.length === 0 && (
+            <Text size="small" color="color.text.subtle">
+              {teamworkGraph?.errorDetail ||
+                'No connected Confluence pages or related Jira issues found in Teamwork Graph for this issue.'}
+            </Text>
+          )}
+        </Stack>
+      </Box>
+
       <ModalTransition>
-        {modalRule && (
+        {modalRules.length > 0 && (
           <Modal onClose={closeModal} width="medium">
             <ModalHeader>
               <ModalTitle>
-                Approve Exception — {modalRule.code}: {modalRule.title}
+                {modalRules.length > 1
+                  ? `Approve All Blocking (${modalRules.length} Standards)`
+                  : `Approve Exception — ${modalRules[0].code}: ${modalRules[0].title}`}
               </ModalTitle>
             </ModalHeader>
             <ModalBody>
               <Stack space="space.150">
-                <Text size="small" color="color.text.subtle">
-                  Missing requirement: {modalRule.detail}
-                </Text>
+                {modalRules.length === 1 ? (
+                  <Text size="small" color="color.text.subtle">
+                    Missing requirement: {modalRules[0].detail}
+                  </Text>
+                ) : (
+                  <Stack space="space.050">
+                    <Text size="small" weight="bold">
+                      Rules included in this batch approval:
+                    </Text>
+                    {modalRules.map((rule) => (
+                      <Text key={rule.ruleId} size="small" color="color.text.subtle">
+                        {rule.code}: {rule.title}
+                      </Text>
+                    ))}
+                    <HelperMessage>
+                      Each rule is saved as an independent exception entry and can be revoked
+                      individually.
+                    </HelperMessage>
+                  </Stack>
+                )}
 
                 <Stack space="space.050">
                   <Label labelFor="exception-reason">Reason for exception</Label>
@@ -357,7 +446,9 @@ const IssuePanel = () => {
                 isLoading={submitting}
                 onClick={handleSubmitApproval}
               >
-                Approve Exception
+                {modalRules.length > 1
+                  ? `Approve ${modalRules.length} Exceptions`
+                  : 'Approve Exception'}
               </LoadingButton>
             </ModalFooter>
           </Modal>

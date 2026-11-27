@@ -3,11 +3,16 @@ import api, { route } from '@forge/api';
 import { CHECK_TYPE_LABELS } from './engine/defaults.js';
 import {
   evaluateIssue,
+  extractAdfContent,
   extractConfluencePageId,
   parseConfluenceStandardsHtml,
+  ruleAppliesToIssueType,
+  ruleAppliesToProject,
 } from './engine/evaluator.js';
+import { fetchIssueTeamworkGraphContext } from './graph/teamworkGraph.js';
 import {
   appendAuditLog,
+  appendAuditLogs,
   getAuditLog,
   getConfluenceSync,
   getExceptions,
@@ -21,11 +26,21 @@ import {
 
 const resolver = new Resolver();
 
+function normalizeProjectKeys(raw) {
+  const list = Array.isArray(raw)
+    ? raw
+    : String(raw || '*')
+        .split(',')
+        .map((item) => item.trim());
+  const cleaned = [...new Set(list.map((p) => String(p || '').trim().toUpperCase()).filter(Boolean))];
+  return cleaned.length > 0 ? cleaned : ['*'];
+}
+
 async function fetchJiraIssue(issueKey) {
   const issueRes = await api
     .asUser()
     .requestJira(
-      route`/rest/api/3/issue/${issueKey}?fields=summary,description,issuetype,status,priority,assignee,labels,issuelinks`
+      route`/rest/api/3/issue/${issueKey}?fields=summary,description,issuetype,status,priority,assignee,labels,issuelinks,project`
     );
 
   if (!issueRes.ok) {
@@ -72,15 +87,31 @@ async function fetchCurrentUser(fallbackAccountId) {
   };
 }
 
-async function evaluateIssueByKey(issueKey) {
+async function evaluateIssueByKey(issueKey, cloudId = '') {
   const [{ issue, remoteLinks }, standards, exceptions] = await Promise.all([
     fetchJiraIssue(issueKey),
     getStandards(),
     getExceptions(),
   ]);
 
-  const evaluation = evaluateIssue({ issue, remoteLinks, standards, exceptions });
-  await recordPrecedentUsage(evaluation.matchedPrecedentIds, issueKey);
+  const descriptionUrls = extractAdfContent(issue.fields?.description).urls;
+  const teamworkGraph = await fetchIssueTeamworkGraphContext({
+    cloudId,
+    issueId: issue.id,
+    issueKey: issue.key || issueKey,
+    remoteLinks,
+    descriptionUrls,
+    issueLinks: issue.fields?.issuelinks,
+  });
+
+  const evaluation = evaluateIssue({
+    issue,
+    remoteLinks,
+    teamworkGraph,
+    standards,
+    exceptions,
+  });
+  await recordPrecedentUsage(evaluation.matchedPrecedentIds, evaluation.issueContext.key || issueKey);
   return evaluation;
 }
 
@@ -91,7 +122,7 @@ resolver.define('evaluateCurrentIssue', async (req) => {
   }
 
   try {
-    const evaluation = await evaluateIssueByKey(issueKey);
+    const evaluation = await evaluateIssueByKey(issueKey, req.context?.cloudId);
     return { ok: true, evaluation };
   } catch (err) {
     return { ok: false, error: err?.message || 'Failed to evaluate issue standards.' };
@@ -100,10 +131,16 @@ resolver.define('evaluateCurrentIssue', async (req) => {
 
 resolver.define('approveException', async (req) => {
   const issueKey = req.context?.extension?.issue?.key;
-  const { ruleId, reason, scope, patternIssueType, requiredLabel } = req.payload || {};
+  const { ruleId, ruleIds, reason, scope, patternIssueType, requiredLabel } = req.payload || {};
 
   if (!issueKey) {
     return { ok: false, error: 'No Jira issue context found.' };
+  }
+
+  const requestedIds = Array.isArray(ruleIds) && ruleIds.length > 0 ? ruleIds : ruleId ? [ruleId] : [];
+  const targetRuleIds = [...new Set(requestedIds.map((id) => String(id || '').trim()).filter(Boolean))];
+  if (targetRuleIds.length === 0) {
+    return { ok: false, error: 'At least one standard rule ID is required.' };
   }
 
   const trimmedReason = String(reason || '').trim();
@@ -113,9 +150,13 @@ resolver.define('approveException', async (req) => {
 
   const normalizedScope = scope === 'precedent' ? 'precedent' : 'issue';
   const standards = await getStandards();
-  const rule = standards.find((r) => r.id === ruleId);
-  if (!rule) {
-    return { ok: false, error: `Standard '${ruleId}' was not found.` };
+  const targetRules = [];
+  for (const targetId of targetRuleIds) {
+    const rule = standards.find((r) => r.id === targetId);
+    if (!rule) {
+      return { ok: false, error: `Standard '${targetId}' was not found.` };
+    }
+    targetRules.push(rule);
   }
 
   const [{ issue }, user, existingExceptions] = await Promise.all([
@@ -126,9 +167,12 @@ resolver.define('approveException', async (req) => {
 
   const issueType = issue.fields?.issuetype?.name || 'Unknown';
   const cleanLabel = String(requiredLabel || '').trim();
+  const now = new Date().toISOString();
+  const batchTs = Date.now();
+  const resolvedPatternType = String(patternIssueType || issueType).trim() || '*';
 
-  const newException = {
-    id: `exc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+  const newExceptions = targetRules.map((rule, idx) => ({
+    id: `exc-${batchTs}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
     ruleId: rule.id,
     ruleCode: rule.code || rule.id,
     ruleTitle: rule.title,
@@ -137,12 +181,12 @@ resolver.define('approveException', async (req) => {
     reason: trimmedReason,
     approverAccountId: user.accountId,
     approverDisplayName: user.displayName,
-    approvedAt: new Date().toISOString(),
+    approvedAt: now,
     scope: normalizedScope,
     pattern:
       normalizedScope === 'precedent'
         ? {
-            issueType: String(patternIssueType || issueType).trim() || '*',
+            issueType: resolvedPatternType,
             requiredLabel: cleanLabel,
           }
         : null,
@@ -150,22 +194,30 @@ resolver.define('approveException', async (req) => {
     revokedAt: null,
     revokedBy: null,
     appliedToIssues: [issueKey],
-  };
+  }));
 
-  await saveExceptions([newException, ...existingExceptions]);
-  await appendAuditLog({
+  const auditEntries = targetRules.map((rule) => ({
     type: 'EXCEPTION_APPROVED',
     actor: user.displayName,
     issueKey,
     ruleCode: rule.code || rule.id,
+    timestamp: now,
     detail:
       normalizedScope === 'precedent'
-        ? `Reusable precedent (${newException.pattern.issueType}${cleanLabel ? ` + label:${cleanLabel}` : ''}): ${trimmedReason}`
+        ? `Reusable precedent (${resolvedPatternType}${cleanLabel ? ` + label:${cleanLabel}` : ''}): ${trimmedReason}`
         : `Issue-only exception: ${trimmedReason}`,
-  });
+  }));
 
-  const evaluation = await evaluateIssueByKey(issueKey);
-  return { ok: true, evaluation, exception: newException };
+  await saveExceptions([...newExceptions, ...existingExceptions]);
+  await appendAuditLogs(auditEntries);
+
+  const evaluation = await evaluateIssueByKey(issueKey, req.context?.cloudId);
+  return {
+    ok: true,
+    evaluation,
+    exceptions: newExceptions,
+    exception: newExceptions[0],
+  };
 });
 
 resolver.define('revokeException', async (req) => {
@@ -201,7 +253,9 @@ resolver.define('revokeException', async (req) => {
   });
 
   const currentIssueKey = req.context?.extension?.issue?.key;
-  const evaluation = currentIssueKey ? await evaluateIssueByKey(currentIssueKey) : null;
+  const evaluation = currentIssueKey
+    ? await evaluateIssueByKey(currentIssueKey, req.context?.cloudId)
+    : null;
 
   return { ok: true, exceptions: updated, auditLog, evaluation };
 });
@@ -254,6 +308,7 @@ resolver.define('saveStandard', async (req) => {
   const issueTypes = Array.isArray(payload.issueTypes)
     ? payload.issueTypes.map((t) => String(t).trim()).filter(Boolean)
     : ['*'];
+  const projectKeys = normalizeProjectKeys(payload.projectKeys);
 
   if (!code || !title) {
     return { ok: false, error: 'Standard code and title are required.' };
@@ -270,22 +325,36 @@ resolver.define('saveStandard', async (req) => {
     fetchCurrentUser(req.context?.accountId),
   ]);
 
-  const ruleId = payload.id || code;
-  const existingIndex = standards.findIndex((r) => r.id === ruleId);
+  const isEditing = Boolean(payload.id);
+  let existingIndex = -1;
 
+  if (isEditing) {
+    existingIndex = standards.findIndex((r) => r.id === payload.id);
+    if (existingIndex < 0) {
+      return { ok: false, error: `Standard '${payload.id}' was not found.` };
+    }
+  } else if (standards.some((r) => r.id === code || String(r.code || '').toUpperCase() === code)) {
+    return {
+      ok: false,
+      error: `Standard code '${code}' already exists. Edit the existing rule or choose a new code.`,
+    };
+  }
+
+  const existingRule = existingIndex >= 0 ? standards[existingIndex] : null;
   const nextRule = {
-    id: ruleId,
-    code,
+    id: existingRule ? existingRule.id : code,
+    code: existingRule ? existingRule.code || code : code,
     title,
     description: description || title,
     issueTypes,
+    projectKeys,
     checkType,
     config: payload.config && typeof payload.config === 'object' ? payload.config : {},
     severity,
     citation: citation || 'Team Governance Policy',
     citationUrl,
-    enabled: existingIndex >= 0 ? standards[existingIndex].enabled : true,
-    source: existingIndex >= 0 ? standards[existingIndex].source : 'custom',
+    enabled: existingRule ? existingRule.enabled : true,
+    source: existingRule ? existingRule.source : 'custom',
   };
 
   const updated =
@@ -297,8 +366,10 @@ resolver.define('saveStandard', async (req) => {
   const auditLog = await appendAuditLog({
     type: 'RULE_UPDATED',
     actor: user.displayName,
-    ruleCode: code,
-    detail: `${existingIndex >= 0 ? 'Updated' : 'Created'} custom standard '${title}'.`,
+    ruleCode: nextRule.code,
+    detail: existingRule
+      ? `Updated ${nextRule.source} standard '${title}'.`
+      : `Created custom standard '${title}'.`,
   });
 
   return { ok: true, standards: updated, auditLog };
@@ -430,39 +501,150 @@ resolver.define('syncConfluencePage', async (req) => {
 
 export const handler = resolver.getDefinitions();
 
-export const pingAction = async (payload) => {
-  const issueKey = String(payload?.issueKey || '').trim();
-  if (issueKey) {
-    try {
-      const evaluation = await evaluateIssueByKey(issueKey);
-      return {
-        ok: true,
-        issueKey,
-        verdict: evaluation.verdict,
-        summary: evaluation.summary,
-        results: evaluation.results.map((r) => ({
-          code: r.code,
-          title: r.title,
-          status: r.status,
-          detail: r.detail,
-          citation: r.citation,
-        })),
-      };
-    } catch (err) {
-      return {
-        ok: false,
-        issueKey,
-        error: err?.message || 'Failed to evaluate issue.',
-      };
-    }
+function getActionInput(payload, key) {
+  if (payload && payload[key] !== undefined && payload[key] !== null) {
+    return payload[key];
+  }
+  return payload?.inputs?.[key];
+}
+
+function getActionCloudId(payload, context) {
+  return String(context?.cloudId || payload?.context?.cloudId || '').trim();
+}
+
+export const checkIssueStandardsAction = async (payload, context) => {
+  const issueKey = String(getActionInput(payload, 'issueKey') || '').trim().toUpperCase();
+  if (!issueKey) {
+    return { ok: false, error: 'issueKey is required (e.g. KAN-2).' };
   }
 
-  const [standards, exceptions] = await Promise.all([getStandards(), getExceptions()]);
+  try {
+    const evaluation = await evaluateIssueByKey(issueKey, getActionCloudId(payload, context));
+    return {
+      ok: true,
+      issueKey: evaluation.issueContext.key,
+      projectKey: evaluation.issueContext.projectKey,
+      issueType: evaluation.issueContext.issueType,
+      verdict: evaluation.verdict,
+      summary: evaluation.summary,
+      teamworkGraph: evaluation.teamworkGraph,
+      results: evaluation.results.map((r) => ({
+        ruleId: r.ruleId,
+        code: r.code,
+        title: r.title,
+        severity: r.severity,
+        status: r.status,
+        detail: r.detail,
+        citation: r.citation,
+        citationUrl: r.citationUrl,
+        exceptionSourceIssue: r.exception?.issueKey || null,
+        exceptionApprover: r.exception?.approverDisplayName || null,
+        exceptionReason: r.exception?.reason || null,
+      })),
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      issueKey,
+      error: err?.message || 'Failed to evaluate issue standards.',
+    };
+  }
+};
+
+export const listStandardsAction = async (payload) => {
+  const projectKey = String(getActionInput(payload, 'projectKey') || '').trim().toUpperCase();
+  const issueType = String(getActionInput(payload, 'issueType') || '').trim();
+
+  const [standards, confluenceSync] = await Promise.all([getStandards(), getConfluenceSync()]);
+  const filtered = standards.filter((rule) => {
+    if (rule.enabled === false) return false;
+    if (projectKey && !ruleAppliesToProject(rule, projectKey)) return false;
+    if (issueType && !ruleAppliesToIssueType(rule, issueType)) return false;
+    return true;
+  });
+
   return {
     ok: true,
-    issueKey: 'NONE',
-    message: 'Jira Standards Guard is active.',
-    activeStandardsCount: standards.filter((r) => r.enabled !== false).length,
-    activePrecedentsCount: exceptions.filter((e) => e.active && e.scope === 'precedent').length,
+    count: filtered.length,
+    confluenceSync,
+    standards: filtered.map((rule) => ({
+      id: rule.id,
+      code: rule.code || rule.id,
+      title: rule.title,
+      description: rule.description,
+      issueTypes: rule.issueTypes || ['*'],
+      projectKeys: rule.projectKeys || ['*'],
+      checkType: rule.checkType,
+      severity: rule.severity,
+      citation: rule.citation,
+      citationUrl: rule.citationUrl || '',
+      source: rule.source,
+    })),
   };
+};
+
+export const listPrecedentsAction = async (payload) => {
+  const rawActiveOnly = getActionInput(payload, 'activeOnly');
+  const activeOnly =
+    rawActiveOnly === undefined || rawActiveOnly === null
+      ? true
+      : typeof rawActiveOnly === 'string'
+        ? rawActiveOnly.toLowerCase() !== 'false'
+        : Boolean(rawActiveOnly);
+
+  const exceptions = await getExceptions();
+  const precedents = exceptions.filter((exc) => {
+    if (exc.scope !== 'precedent') return false;
+    return activeOnly ? exc.active === true : true;
+  });
+
+  return {
+    ok: true,
+    count: precedents.length,
+    precedents: precedents.map((exc) => ({
+      id: exc.id,
+      ruleCode: exc.ruleCode || exc.ruleId,
+      ruleTitle: exc.ruleTitle,
+      sourceIssueKey: exc.issueKey,
+      pattern: exc.pattern,
+      reason: exc.reason,
+      approver: exc.approverDisplayName,
+      approvedAt: exc.approvedAt,
+      active: exc.active,
+      appliedToIssues: exc.appliedToIssues || [exc.issueKey],
+    })),
+  };
+};
+
+export const getIssueGraphContextAction = async (payload, context) => {
+  const issueKey = String(getActionInput(payload, 'issueKey') || '').trim().toUpperCase();
+  if (!issueKey) {
+    return { ok: false, error: 'issueKey is required (e.g. KAN-3).' };
+  }
+
+  try {
+    const { issue, remoteLinks } = await fetchJiraIssue(issueKey);
+    const descriptionUrls = extractAdfContent(issue.fields?.description).urls;
+    const teamworkGraph = await fetchIssueTeamworkGraphContext({
+      cloudId: getActionCloudId(payload, context),
+      issueId: issue.id,
+      issueKey: issue.key || issueKey,
+      remoteLinks,
+      descriptionUrls,
+      issueLinks: issue.fields?.issuelinks,
+    });
+
+    return {
+      ok: true,
+      issueKey: issue.key || issueKey,
+      projectKey: String(issue.fields?.project?.key || '').trim().toUpperCase(),
+      teamworkGraph,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      issueKey,
+      error: err?.message || 'Failed to retrieve Teamwork Graph context.',
+    };
+  }
 };

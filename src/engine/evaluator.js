@@ -275,6 +275,10 @@ export function parseConfluenceStandardsHtml(storageHtml, pageTitle = 'Confluenc
         .split(',')
         .map((t) => t.trim())
         .filter(Boolean);
+      const projectKeys = (parsed.PROJECT || '*')
+        .split(',')
+        .map((p) => p.trim().toUpperCase())
+        .filter(Boolean);
       const severity = parsed.SEVERITY?.toLowerCase() === 'warning' ? 'warning' : 'blocking';
 
       rules.push({
@@ -283,6 +287,7 @@ export function parseConfluenceStandardsHtml(storageHtml, pageTitle = 'Confluenc
         title,
         description: line,
         issueTypes: issueTypes.length > 0 ? issueTypes : ['*'],
+        projectKeys: projectKeys.length > 0 ? projectKeys : ['*'],
         checkType,
         config: buildConfigForCheck(checkType, parsed.VALUE || ''),
         severity,
@@ -321,6 +326,7 @@ export function parseConfluenceStandardsHtml(storageHtml, pageTitle = 'Confluenc
       title,
       description: bodyText,
       issueTypes: inferred.issueTypes,
+      projectKeys: ['*'],
       checkType: inferred.checkType,
       config: inferred.config,
       severity: 'blocking',
@@ -441,14 +447,22 @@ export function evaluateRule(rule, issueContext) {
     }
 
     case 'has_link_or_url': {
+      const graphLinksCount =
+        (issueContext.graphLinkedPagesCount || 0) + (issueContext.graphRelatedIssuesCount || 0);
       const totalLinks =
-        issueContext.issueLinksCount + issueContext.remoteLinksCount + issueContext.urls.length;
+        issueContext.issueLinksCount +
+        issueContext.remoteLinksCount +
+        issueContext.urls.length +
+        graphLinksCount;
       const passed = totalLinks > 0;
+      const baseDetail = `Found ${issueContext.issueLinksCount} Jira link(s), ${issueContext.remoteLinksCount} remote link(s), and ${issueContext.urls.length} description URL(s)`;
       return {
         passed,
         detail: passed
-          ? `Found ${issueContext.issueLinksCount} Jira link(s), ${issueContext.remoteLinksCount} remote link(s), and ${issueContext.urls.length} description URL(s).`
-          : 'No linked Jira issue, Confluence/remote link, or reference URL found.',
+          ? graphLinksCount > 0
+            ? `${baseDetail}, plus ${graphLinksCount} Teamwork Graph connection(s).`
+            : `${baseDetail}.`
+          : 'No linked Jira issue, Confluence/remote link, Teamwork Graph connection, or reference URL found.',
       };
     }
 
@@ -473,15 +487,18 @@ export function evaluateRule(rule, issueContext) {
   }
 }
 
-function buildIssueContext(issue, remoteLinks) {
+function buildIssueContext(issue, remoteLinks, teamworkGraph = null) {
   const fields = issue?.fields || {};
   const { text, urls } = extractAdfContent(fields.description);
   const issueLinks = Array.isArray(fields.issuelinks) ? fields.issuelinks : [];
   const safeRemoteLinks = Array.isArray(remoteLinks) ? remoteLinks : [];
   const labels = Array.isArray(fields.labels) ? fields.labels : [];
+  const key = issue?.key || 'UNKNOWN';
+  const derivedProjectKey = key.includes('-') ? key.split('-')[0] : '';
 
   return {
-    key: issue?.key || 'UNKNOWN',
+    key,
+    projectKey: String(fields.project?.key || derivedProjectKey).trim().toUpperCase(),
     summary: fields.summary || '',
     issueType: fields.issuetype?.name || 'Unknown',
     statusName: fields.status?.name || 'Unknown',
@@ -494,22 +511,53 @@ function buildIssueContext(issue, remoteLinks) {
     urls,
     issueLinksCount: issueLinks.length,
     remoteLinksCount: safeRemoteLinks.length,
+    graphLinkedPagesCount: Array.isArray(teamworkGraph?.linkedPages)
+      ? teamworkGraph.linkedPages.length
+      : 0,
+    graphRelatedIssuesCount: Array.isArray(teamworkGraph?.relatedIssues)
+      ? teamworkGraph.relatedIssues.length
+      : 0,
   };
 }
 
-function ruleAppliesToIssueType(rule, issueType) {
+/**
+ * Checks whether a rule applies to the issue's issue type.
+ */
+export function ruleAppliesToIssueType(rule, issueType) {
   const types = Array.isArray(rule.issueTypes) && rule.issueTypes.length > 0 ? rule.issueTypes : ['*'];
   const normalized = String(issueType || '').toLowerCase();
   return types.some((t) => t === '*' || String(t).toLowerCase() === normalized);
 }
 
 /**
+ * Checks whether a rule applies to the issue's Jira project key.
+ */
+export function ruleAppliesToProject(rule, projectKey) {
+  const keys =
+    Array.isArray(rule?.projectKeys) && rule.projectKeys.length > 0 ? rule.projectKeys : ['*'];
+  const normalized = String(projectKey || '').trim().toUpperCase();
+  return keys.some((k) => {
+    const candidate = String(k || '').trim().toUpperCase();
+    return candidate === '*' || (Boolean(normalized) && candidate === normalized);
+  });
+}
+
+/**
  * Evaluates a Jira issue against enabled standards and active exceptions/precedents.
  */
-export function evaluateIssue({ issue, remoteLinks = [], standards = [], exceptions = [] }) {
-  const issueContext = buildIssueContext(issue, remoteLinks);
+export function evaluateIssue({
+  issue,
+  remoteLinks = [],
+  teamworkGraph = null,
+  standards = [],
+  exceptions = [],
+}) {
+  const issueContext = buildIssueContext(issue, remoteLinks, teamworkGraph);
   const applicableRules = standards.filter(
-    (rule) => rule.enabled !== false && ruleAppliesToIssueType(rule, issueContext.issueType)
+    (rule) =>
+      rule.enabled !== false &&
+      ruleAppliesToIssueType(rule, issueContext.issueType) &&
+      ruleAppliesToProject(rule, issueContext.projectKey)
   );
 
   const summary = {
@@ -614,6 +662,7 @@ export function evaluateIssue({ issue, remoteLinks = [], standards = [], excepti
     verdict,
     evaluatedAt: new Date().toISOString(),
     issueContext,
+    teamworkGraph: teamworkGraph || null,
     summary,
     results,
     matchedPrecedentIds,

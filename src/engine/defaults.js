@@ -14,6 +14,7 @@ export const DEFAULT_STANDARDS = [
     description:
       'Issue description must contain at least 40 characters explaining context and scope.',
     issueTypes: ['*'],
+    projectKeys: ['*'],
     checkType: 'description_min_length',
     config: { minLength: 40 },
     severity: 'blocking',
@@ -29,6 +30,7 @@ export const DEFAULT_STANDARDS = [
     description:
       'Bug reports must include reproduction steps or expected vs. actual behavior.',
     issueTypes: ['Bug'],
+    projectKeys: ['*'],
     checkType: 'description_contains_any',
     config: {
       keywords: ['steps to reproduce', 'repro', 'reproduction', 'expected', 'actual'],
@@ -46,6 +48,7 @@ export const DEFAULT_STANDARDS = [
     description:
       'Stories and Tasks must specify explicit acceptance criteria or definition of done.',
     issueTypes: ['Story', 'Task'],
+    projectKeys: ['*'],
     checkType: 'description_contains_any',
     config: {
       keywords: [
@@ -70,6 +73,7 @@ export const DEFAULT_STANDARDS = [
     title: 'Owner Assigned',
     description: 'Every issue must have an assigned owner before moving to Done.',
     issueTypes: ['*'],
+    projectKeys: ['*'],
     checkType: 'field_present',
     config: { field: 'assignee' },
     severity: 'blocking',
@@ -84,6 +88,7 @@ export const DEFAULT_STANDARDS = [
     title: 'Priority Triaged',
     description: 'Bugs and Stories should have an explicit priority assigned.',
     issueTypes: ['Bug', 'Story'],
+    projectKeys: ['*'],
     checkType: 'field_present',
     config: { field: 'priority' },
     severity: 'warning',
@@ -97,8 +102,9 @@ export const DEFAULT_STANDARDS = [
     code: 'STD-6',
     title: 'Reference Doc, Test, or Linked Work',
     description:
-      'Bugs and Stories must link a related Jira issue, Confluence/web link, or reference URL in the description.',
+      'Bugs and Stories must link a related Jira issue, Teamwork Graph connected Confluence page, remote link, or reference URL in the description.',
     issueTypes: ['Bug', 'Story'],
+    projectKeys: ['*'],
     checkType: 'has_link_or_url',
     config: {},
     severity: 'blocking',

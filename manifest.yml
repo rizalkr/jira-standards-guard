@@ -19,35 +19,89 @@ modules:
     - key: standards-guard-mcp
       name: Jira Standards Guard MCP
       tools:
-        - standards-guard-ping
+        - check-issue-standards
+        - list-standards
+        - list-precedents
+        - get-issue-graph-context
   rovo:agent:
     - key: standards-guard-agent
       name: Standards Guard
-      description: Evaluates Jira issues against team standards and approved exception precedents.
+      description: Evaluates Jira issues against engineering standards, Confluence policies, Teamwork Graph links, and approved exception precedents.
       prompt: |
         You are Jira Standards Guard, an engineering governance assistant.
-        Use the available actions to inspect issue readiness against team standards and report factual results with citations.
+        Always call the available actions before answering questions about issue readiness, active standards, reusable precedents, or Teamwork Graph context.
+        Report factual evaluation results with exact standard codes (e.g. STD-1, CONF-1), policy citations, Teamwork Graph linked pages/issues, and exception precedent source issue keys.
+        Never invent compliance results or claim an exception is approved unless an active human-approved record is returned by the actions.
       conversationStarters:
         - Check standards readiness for this issue
+        - List active engineering standards and citations
+        - Inspect Teamwork Graph context for this issue
       actions:
-        - standards-guard-ping
+        - check-issue-standards
+        - list-standards
+        - list-precedents
+        - get-issue-graph-context
   action:
-    - key: standards-guard-ping
-      name: Check Standards Guard Health
-      function: action-handler
+    - key: check-issue-standards
+      name: Check Issue Standards
+      function: action-check-issue
       actionVerb: GET
-      description: Verifies Jira Standards Guard connectivity and returns status for an optional Jira issue key.
+      description: Evaluates a Jira issue deterministically against enabled standards, Confluence-synced rules, Teamwork Graph context, and approved exception precedents.
       inputs:
         issueKey:
           title: Issue Key
           type: string
+          required: true
+          description: The Jira issue key to evaluate (e.g. KAN-2).
+    - key: list-standards
+      name: List Active Standards
+      function: action-list-standards
+      actionVerb: GET
+      description: Lists active Jira Standards Guard rules, policy citations, severity, and Confluence sync metadata.
+      inputs:
+        projectKey:
+          title: Project Key
+          type: string
           required: false
-          description: Optional Jira issue key to inspect (e.g. KAN-1).
+          description: Optional Jira project key filter (e.g. KAN).
+        issueType:
+          title: Issue Type
+          type: string
+          required: false
+          description: Optional Jira issue type filter (e.g. Bug, Story).
+    - key: list-precedents
+      name: List Exception Precedents
+      function: action-list-precedents
+      actionVerb: GET
+      description: Lists human-approved reusable exception precedents, matching patterns, approvers, and applied issue history.
+      inputs:
+        activeOnly:
+          title: Active Only
+          type: boolean
+          required: false
+          description: When true (default), returns only active precedents; set false to include revoked precedents.
+    - key: get-issue-graph-context
+      name: Get Issue Teamwork Graph Context
+      function: action-graph-context
+      actionVerb: GET
+      description: Retrieves Atlassian Teamwork Graph context for a Jira issue, including connected Confluence pages and related Jira issues.
+      inputs:
+        issueKey:
+          title: Issue Key
+          type: string
+          required: true
+          description: The Jira issue key to inspect in Teamwork Graph (e.g. KAN-3).
   function:
     - key: resolver
       handler: index.handler
-    - key: action-handler
-      handler: index.pingAction
+    - key: action-check-issue
+      handler: index.checkIssueStandardsAction
+    - key: action-list-standards
+      handler: index.listStandardsAction
+    - key: action-list-precedents
+      handler: index.listPrecedentsAction
+    - key: action-graph-context
+      handler: index.getIssueGraphContextAction
 resources:
   - key: issue-panel-ui
     path: src/frontend/issue-panel.jsx

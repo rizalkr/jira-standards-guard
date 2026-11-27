@@ -6,7 +6,14 @@ import {
   extractAdfContent,
   extractConfluencePageId,
   parseConfluenceStandardsHtml,
+  ruleAppliesToProject,
 } from '../src/engine/evaluator.js';
+import {
+  buildConfluencePageAri,
+  buildIssueAri,
+  fetchIssueTeamworkGraphContext,
+} from '../src/graph/teamworkGraph.js';
+import { applyPrecedentUsage } from '../src/storage/store.js';
 
 function makeAdfDoc(text, extraNodes = []) {
   return {
@@ -279,4 +286,200 @@ test('Confluence page ID extraction and standards HTML parsing work for structur
   assert.equal(parsed[1].code, 'STD-C1');
   assert.equal(parsed[1].title, 'Rollback Plan');
   assert.equal(parsed[1].citation, 'Engineering Standards (Confluence)');
+});
+
+test('projectKeys scoping filters rules by project and supports Confluence PROJECT directive', () => {
+  assert.equal(ruleAppliesToProject({ id: 'LEGACY' }, 'KAN'), true);
+  assert.equal(ruleAppliesToProject({ projectKeys: ['*'] }, 'KAN'), true);
+  assert.equal(ruleAppliesToProject({ projectKeys: ['KAN', 'PAY'] }, 'pay'), true);
+  assert.equal(ruleAppliesToProject({ projectKeys: ['KAN'] }, 'OPS'), false);
+
+  const html = `
+    <ul>
+      <li>RULE: Payments Audit | TYPE: Story | PROJECT: PAY, FIN | CHECK: label_present | VALUE: audited | SEVERITY: blocking</li>
+    </ul>
+  `;
+  const [rule] = parseConfluenceStandardsHtml(html, 'Payments Standards');
+  assert.deepEqual(rule.projectKeys, ['PAY', 'FIN']);
+
+  const opsIssue = {
+    key: 'OPS-7',
+    fields: {
+      project: { key: 'OPS' },
+      summary: 'Rotate DNS keys',
+      description: makeAdfDoc('Rotate edge DNS keys cleanly.'),
+      issuetype: { name: 'Story' },
+      status: { name: 'In Progress' },
+      labels: [],
+      issuelinks: [],
+    },
+  };
+  const opsEval = evaluateIssue({ issue: opsIssue, standards: [rule], exceptions: [] });
+  assert.equal(opsEval.summary.total, 0);
+  assert.equal(opsEval.verdict, 'READY');
+
+  const payIssue = {
+    ...opsIssue,
+    key: 'PAY-12',
+    fields: { ...opsIssue.fields, project: { key: 'PAY' } },
+  };
+  const payEval = evaluateIssue({ issue: payIssue, standards: [rule], exceptions: [] });
+  assert.equal(payEval.summary.total, 1);
+  assert.equal(payEval.verdict, 'BLOCKED');
+});
+
+test('fetchIssueTeamworkGraphContext handles ARI validation, APIResponse parsing, partial fallback, and HTTP errors', async () => {
+  assert.equal(buildIssueAri('cloud-1', '10001'), 'ari:cloud:jira:cloud-1:issue/10001');
+  assert.equal(buildConfluencePageAri('cloud-1', '983041'), 'ari:cloud:confluence:cloud-1:page/983041');
+
+  const missingCloud = await fetchIssueTeamworkGraphContext({ cloudId: '', issueId: '10001' });
+  assert.equal(missingCloud.status, 'unavailable');
+  assert.deepEqual(missingCloud.linkedPages, []);
+
+  // Normal + partial curated fallback: jiraWorkItemLinkedConfluencePages errors, confluencePage hydrates from URL.
+  const partialCtx = await fetchIssueTeamworkGraphContext({
+    cloudId: 'cloud-1',
+    issueId: '10002',
+    issueKey: 'KAN-3',
+    descriptionUrls: ['https://rizalkurnia-me.atlassian.net/wiki/spaces/SD/pages/983041/Engineering+Standards'],
+    issueLinks: [
+      {
+        type: { outward: 'blocks' },
+        outwardIssue: {
+          id: '10001',
+          key: 'KAN-2',
+          fields: { summary: 'Fallback summary', status: { name: 'To Do' } },
+        },
+      },
+    ],
+    requester: async (_q, variables, op) => ({
+      ok: true,
+      json: async () => {
+        if (op === 'StandardsGuard_GetIssueContext') {
+          if (variables.id.endsWith('/10002')) {
+            return {
+              data: { jiraWorkItem: { id: variables.id, key: 'KAN-3', summary: 'Webhook retries' } },
+            };
+          }
+          return {
+            data: {
+              jiraWorkItem: {
+                id: variables.id,
+                key: 'KAN-2',
+                summary: 'Checkout timeout',
+                status: { name: 'Blocked' },
+              },
+            },
+          };
+        }
+        if (op === 'StandardsGuard_GetLinkedPages') {
+          return { errors: [{ message: 'Field unsupported on this tenant' }] };
+        }
+        if (op === 'StandardsGuard_GetConfluencePage') {
+          return { data: { confluencePage: { id: variables.id, title: 'Engineering Standards' } } };
+        }
+        return { data: {} };
+      },
+    }),
+  });
+
+  assert.equal(partialCtx.status, 'ok');
+  assert.equal(partialCtx.linkedPages.length, 1);
+  assert.equal(partialCtx.linkedPages[0].title, 'Engineering Standards');
+  assert.equal(partialCtx.relatedIssues.length, 1);
+  assert.equal(partialCtx.relatedIssues[0].key, 'KAN-2');
+  assert.equal(partialCtx.relatedIssues[0].hydratedByGraph, true);
+
+  // HTTP error returns degraded error status without throwing.
+  const httpErrCtx = await fetchIssueTeamworkGraphContext({
+    cloudId: 'cloud-1',
+    issueId: '10002',
+    requester: async () => ({ ok: false, status: 503 }),
+  });
+  assert.equal(httpErrCtx.status, 'error');
+  assert.match(httpErrCtx.errorDetail, /503/);
+});
+
+test('has_link_or_url passes when Teamwork Graph provides connected Confluence pages', () => {
+  const std6 = DEFAULT_STANDARDS.find((r) => r.id === 'STD-6');
+  const issue = {
+    key: 'KAN-99',
+    fields: {
+      project: { key: 'KAN' },
+      summary: 'Harden webhook queue',
+      description: makeAdfDoc('No inline URLs in the Jira description body yet.'),
+      issuetype: { name: 'Story' },
+      status: { name: 'In Progress' },
+      labels: [],
+      issuelinks: [],
+    },
+  };
+
+  const withoutGraph = evaluateIssue({
+    issue,
+    remoteLinks: [],
+    teamworkGraph: { status: 'ok', linkedPages: [], relatedIssues: [] },
+    standards: [std6],
+    exceptions: [],
+  });
+  assert.equal(withoutGraph.verdict, 'BLOCKED');
+
+  const withGraph = evaluateIssue({
+    issue,
+    remoteLinks: [],
+    teamworkGraph: {
+      status: 'ok',
+      linkedPages: [{ id: 'ari:cloud:confluence:c1:page/123', title: 'Architecture Spec', url: '' }],
+      relatedIssues: [],
+    },
+    standards: [std6],
+    exceptions: [],
+  });
+  assert.equal(withGraph.verdict, 'READY');
+  assert.match(withGraph.results[0].detail, /Teamwork Graph connection/);
+});
+
+test('applyPrecedentUsage logs PRECEDENT_APPLIED once per issue and deduplicates re-checks', () => {
+  const initialExceptions = [
+    {
+      id: 'prec-1',
+      ruleId: 'STD-2',
+      ruleCode: 'STD-2',
+      issueKey: 'KAN-4',
+      scope: 'precedent',
+      approverDisplayName: 'Rizal Kurnia',
+      reason: 'Typo bug fix does not require full repro script',
+      active: true,
+      appliedToIssues: ['KAN-4'],
+    },
+  ];
+
+  const firstRun = applyPrecedentUsage({
+    exceptions: initialExceptions,
+    auditLog: [],
+    precedentIds: ['prec-1'],
+    issueKey: 'KAN-5',
+    nowIso: '2026-11-27T10:00:00.000Z',
+  });
+
+  assert.equal(firstRun.modified, true);
+  assert.deepEqual(firstRun.newlyAppliedIds, ['prec-1']);
+  assert.deepEqual(firstRun.exceptions[0].appliedToIssues, ['KAN-4', 'KAN-5']);
+  assert.equal(firstRun.auditLog.length, 1);
+  assert.equal(firstRun.auditLog[0].type, 'PRECEDENT_APPLIED');
+  assert.equal(firstRun.auditLog[0].issueKey, 'KAN-5');
+  assert.equal(firstRun.auditLog[0].ruleCode, 'STD-2');
+  assert.match(firstRun.auditLog[0].detail, /KAN-4/);
+
+  const secondRun = applyPrecedentUsage({
+    exceptions: firstRun.exceptions,
+    auditLog: firstRun.auditLog,
+    precedentIds: ['prec-1'],
+    issueKey: 'KAN-5',
+    nowIso: '2026-11-27T10:05:00.000Z',
+  });
+
+  assert.equal(secondRun.modified, false);
+  assert.deepEqual(secondRun.newlyAppliedIds, []);
+  assert.equal(secondRun.auditLog.length, 1);
 });

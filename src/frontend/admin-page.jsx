@@ -58,8 +58,16 @@ const CHECK_VALUE_HELPERS = {
   description_min_length: 'Enter minimum character count (e.g. 40).',
   description_contains_any: 'Comma-separated keywords (e.g. security review, threat model).',
   field_present: 'Enter one of: assignee, priority, labels, description.',
-  has_link_or_url: 'No value required; checks Jira links, remote links, and URLs in description.',
+  has_link_or_url:
+    'No value required; checks Jira links, Teamwork Graph connected pages, remote links, and URLs in description.',
   label_present: 'Comma-separated label names (e.g. reviewed, qa-verified).',
+};
+
+const AUDIT_EVENT_APPEARANCES = {
+  PRECEDENT_APPLIED: 'inprogress',
+  EXCEPTION_APPROVED: 'moved',
+  PRECEDENT_REVOKED: 'removed',
+  CONFLUENCE_SYNCED: 'success',
 };
 
 function buildCheckConfig(checkType, rawValue) {
@@ -89,6 +97,23 @@ function buildCheckConfig(checkType, rawValue) {
   }
 }
 
+function formatConfigToCheckValue(checkType, config) {
+  const safe = config || {};
+  switch (checkType) {
+    case 'description_min_length':
+      return String(safe.minLength || 40);
+    case 'description_contains_any':
+      return Array.isArray(safe.keywords) ? safe.keywords.join(', ') : '';
+    case 'field_present':
+      return String(safe.field || 'assignee');
+    case 'label_present':
+      return Array.isArray(safe.labels) ? safe.labels.join(', ') : '';
+    case 'has_link_or_url':
+    default:
+      return '';
+  }
+}
+
 const AdminPage = () => {
   const [data, setData] = useState({
     standards: [],
@@ -105,11 +130,14 @@ const AdminPage = () => {
   const [syncingConfluence, setSyncingConfluence] = useState(false);
 
   const [showAddModal, setShowAddModal] = useState(false);
+  const [editingRuleId, setEditingRuleId] = useState(null);
   const [ruleCode, setRuleCode] = useState('');
   const [ruleTitle, setRuleTitle] = useState('');
   const [ruleDescription, setRuleDescription] = useState('');
   const [ruleCitation, setRuleCitation] = useState('');
+  const [ruleCitationUrl, setRuleCitationUrl] = useState('');
   const [ruleIssueTypes, setRuleIssueTypes] = useState('*');
+  const [ruleProjectKeys, setRuleProjectKeys] = useState('*');
   const [ruleCheckType, setRuleCheckType] = useState(CHECK_TYPE_OPTIONS[1]);
   const [ruleCheckValue, setRuleCheckValue] = useState('');
   const [ruleSeverity, setRuleSeverity] = useState(SEVERITY_OPTIONS[0]);
@@ -141,6 +169,52 @@ const AdminPage = () => {
   useEffect(() => {
     loadAdminData();
   }, [loadAdminData]);
+
+  const openAddModal = () => {
+    setEditingRuleId(null);
+    setRuleCode('');
+    setRuleTitle('');
+    setRuleDescription('');
+    setRuleCitation('');
+    setRuleCitationUrl('');
+    setRuleIssueTypes('*');
+    setRuleProjectKeys('*');
+    setRuleCheckType(CHECK_TYPE_OPTIONS[1]);
+    setRuleCheckValue('');
+    setRuleSeverity(SEVERITY_OPTIONS[0]);
+    setModalError('');
+    setShowAddModal(true);
+  };
+
+  const openEditModal = (rule) => {
+    const matchedCheck =
+      CHECK_TYPE_OPTIONS.find((opt) => opt.value === rule.checkType) || CHECK_TYPE_OPTIONS[1];
+    const matchedSeverity =
+      SEVERITY_OPTIONS.find((opt) => opt.value === rule.severity) || SEVERITY_OPTIONS[0];
+
+    setEditingRuleId(rule.id);
+    setRuleCode(rule.code || rule.id);
+    setRuleTitle(rule.title || '');
+    setRuleDescription(rule.description || '');
+    setRuleCitation(rule.citation || '');
+    setRuleCitationUrl(rule.citationUrl || '');
+    setRuleIssueTypes(Array.isArray(rule.issueTypes) && rule.issueTypes.length > 0 ? rule.issueTypes.join(', ') : '*');
+    setRuleProjectKeys(
+      Array.isArray(rule.projectKeys) && rule.projectKeys.length > 0 ? rule.projectKeys.join(', ') : '*'
+    );
+    setRuleCheckType(matchedCheck);
+    setRuleCheckValue(formatConfigToCheckValue(rule.checkType, rule.config));
+    setRuleSeverity(matchedSeverity);
+    setModalError('');
+    setShowAddModal(true);
+  };
+
+  const closeModal = () => {
+    if (savingRule) return;
+    setShowAddModal(false);
+    setEditingRuleId(null);
+    setModalError('');
+  };
 
   const handleToggleRule = async (ruleId, nextEnabled) => {
     setBusyKey(ruleId);
@@ -228,13 +302,20 @@ const AdminPage = () => {
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
+      const projectKeys = ruleProjectKeys
+        .split(',')
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean);
 
       const res = await invoke('saveStandard', {
+        id: editingRuleId || undefined,
         code,
         title,
         description: ruleDescription.trim() || title,
         citation: ruleCitation.trim() || 'Team Governance Policy',
+        citationUrl: ruleCitationUrl.trim(),
         issueTypes: issueTypes.length > 0 ? issueTypes : ['*'],
+        projectKeys: projectKeys.length > 0 ? projectKeys : ['*'],
         checkType,
         config: buildCheckConfig(checkType, ruleCheckValue),
         severity: ruleSeverity?.value || 'blocking',
@@ -249,16 +330,13 @@ const AdminPage = () => {
           auditLog: res.auditLog || prev.auditLog,
         }));
         setShowAddModal(false);
-        setRuleCode('');
-        setRuleTitle('');
-        setRuleDescription('');
-        setRuleCitation('');
-        setRuleIssueTypes('*');
-        setRuleCheckValue('');
-        setFeedback(`Saved custom standard ${code}.`);
+        setEditingRuleId(null);
+        setFeedback(
+          editingRuleId ? `Updated standard ${code}.` : `Saved custom standard ${code}.`
+        );
       }
     } catch (err) {
-      setModalError(err?.message || 'Unexpected error saving custom standard.');
+      setModalError(err?.message || 'Unexpected error saving standard.');
     } finally {
       setSavingRule(false);
     }
@@ -334,6 +412,7 @@ const AdminPage = () => {
       { key: 'code', content: 'Code' },
       { key: 'title', content: 'Standard & Citation' },
       { key: 'types', content: 'Issue Types' },
+      { key: 'projects', content: 'Projects' },
       { key: 'check', content: 'Check' },
       { key: 'severity', content: 'Severity' },
       { key: 'source', content: 'Source' },
@@ -358,6 +437,16 @@ const AdminPage = () => {
         ),
       },
       { key: 'types', content: <Text>{(rule.issueTypes || ['*']).join(', ')}</Text> },
+      {
+        key: 'projects',
+        content: (
+          <Text>
+            {!rule.projectKeys || rule.projectKeys.includes('*')
+              ? 'All (*)'
+              : rule.projectKeys.join(', ')}
+          </Text>
+        ),
+      },
       { key: 'check', content: <Text size="small">{rule.checkType}</Text> },
       {
         key: 'severity',
@@ -388,20 +477,22 @@ const AdminPage = () => {
       },
       {
         key: 'actions',
-        content:
-          rule.source !== 'builtin' ? (
-            <LoadingButton
-              appearance="subtle"
-              isLoading={busyKey === `del-${rule.id}`}
-              onClick={() => handleDeleteRule(rule.id)}
-            >
-              Delete
-            </LoadingButton>
-          ) : (
-            <Text size="small" color="color.text.subtle">
-              Built-in
-            </Text>
-          ),
+        content: (
+          <Inline space="space.050">
+            <Button appearance="subtle" onClick={() => openEditModal(rule)}>
+              Edit
+            </Button>
+            {rule.source !== 'builtin' && (
+              <LoadingButton
+                appearance="subtle"
+                isLoading={busyKey === `del-${rule.id}`}
+                onClick={() => handleDeleteRule(rule.id)}
+              >
+                Delete
+              </LoadingButton>
+            )}
+          </Inline>
+        ),
       },
     ],
   }));
@@ -500,7 +591,14 @@ const AdminPage = () => {
     key: entry.id,
     cells: [
       { key: 'time', content: <Text size="small">{entry.timestamp?.slice(0, 19).replace('T', ' ')}</Text> },
-      { key: 'event', content: <Lozenge appearance="default">{entry.type}</Lozenge> },
+      {
+        key: 'event',
+        content: (
+          <Lozenge appearance={AUDIT_EVENT_APPEARANCES[entry.type] || 'default'}>
+            {entry.type}
+          </Lozenge>
+        ),
+      },
       { key: 'actor', content: <Text size="small">{entry.actor}</Text> },
       { key: 'issue', content: <Text size="small">{entry.issueKey || '—'}</Text> },
       { key: 'rule', content: <Text size="small">{entry.ruleCode || '—'}</Text> },
@@ -546,7 +644,7 @@ const AdminPage = () => {
           <Box paddingBlockStart="space.200">
             <Stack space="space.150">
               <Inline space="space.100">
-                <Button appearance="primary" onClick={() => setShowAddModal(true)}>
+                <Button appearance="primary" onClick={openAddModal}>
                   Add Custom Standard
                 </Button>
                 <LoadingButton
@@ -618,7 +716,7 @@ const AdminPage = () => {
                   <Text size="small">
                     Structured rule bullet: RULE: Security Review Required | TYPE: Story, Task |
                     CHECK: description_contains_any | VALUE: security review, threat model |
-                    SEVERITY: blocking
+                    SEVERITY: blocking (optional: | PROJECT: KAN, PAY)
                   </Text>
                   <Text size="small">
                     Natural rule bullet: [STD-C1] Rollback Plan: Include rollback steps in the
@@ -660,9 +758,11 @@ const AdminPage = () => {
 
       <ModalTransition>
         {showAddModal && (
-          <Modal onClose={() => !savingRule && setShowAddModal(false)} width="medium">
+          <Modal onClose={closeModal} width="medium">
             <ModalHeader>
-              <ModalTitle>Add Custom Standard</ModalTitle>
+              <ModalTitle>
+                {editingRuleId ? `Edit Standard — ${ruleCode}` : 'Add Custom Standard'}
+              </ModalTitle>
             </ModalHeader>
             <ModalBody>
               <Stack space="space.150">
@@ -671,6 +771,7 @@ const AdminPage = () => {
                   <Textfield
                     id="rule-code"
                     placeholder="e.g. STD-7"
+                    isDisabled={Boolean(editingRuleId)}
                     value={ruleCode}
                     onChange={(e) => setRuleCode(e?.target?.value || '')}
                   />
@@ -707,6 +808,16 @@ const AdminPage = () => {
                 </Stack>
 
                 <Stack space="space.050">
+                  <Label labelFor="rule-citation-url">Citation URL (optional)</Label>
+                  <Textfield
+                    id="rule-citation-url"
+                    placeholder="https://your-site.atlassian.net/wiki/..."
+                    value={ruleCitationUrl}
+                    onChange={(e) => setRuleCitationUrl(e?.target?.value || '')}
+                  />
+                </Stack>
+
+                <Stack space="space.050">
                   <Label labelFor="rule-types">Applies to Issue Types</Label>
                   <Textfield
                     id="rule-types"
@@ -714,6 +825,19 @@ const AdminPage = () => {
                     value={ruleIssueTypes}
                     onChange={(e) => setRuleIssueTypes(e?.target?.value || '')}
                   />
+                </Stack>
+
+                <Stack space="space.050">
+                  <Label labelFor="rule-project-keys">Project Keys (comma-separated or *)</Label>
+                  <Textfield
+                    id="rule-project-keys"
+                    placeholder="*, KAN, PAY"
+                    value={ruleProjectKeys}
+                    onChange={(e) => setRuleProjectKeys(e?.target?.value || '')}
+                  />
+                  <HelperMessage>
+                    Use * for all projects, or specify Jira project keys such as KAN, PAY.
+                  </HelperMessage>
                 </Stack>
 
                 <Stack space="space.050">
@@ -754,11 +878,7 @@ const AdminPage = () => {
               </Stack>
             </ModalBody>
             <ModalFooter>
-              <Button
-                appearance="subtle"
-                onClick={() => setShowAddModal(false)}
-                isDisabled={savingRule}
-              >
+              <Button appearance="subtle" onClick={closeModal} isDisabled={savingRule}>
                 Cancel
               </Button>
               <LoadingButton
