@@ -63,7 +63,7 @@ const IssuePanel = () => {
 
   const [modalRules, setModalRules] = useState([]);
   const [reason, setReason] = useState('');
-  const [saveAsPrecedent, setSaveAsPrecedent] = useState(true);
+  const [saveAsPrecedent, setSaveAsPrecedent] = useState(false);
   const [patternIssueType, setPatternIssueType] = useState(null);
   const [requiredLabel, setRequiredLabel] = useState('');
   const [modalError, setModalError] = useState('');
@@ -94,9 +94,10 @@ const IssuePanel = () => {
     const rules = Array.isArray(ruleList) ? ruleList : [ruleList];
     const issueType = evaluation?.issueContext?.issueType || 'Bug';
     const firstLabel = evaluation?.issueContext?.labels?.[0] || '';
+    const defaultPrecedent = rules.length === 1 && Boolean(firstLabel);
     setModalRules(rules);
     setReason('');
-    setSaveAsPrecedent(true);
+    setSaveAsPrecedent(defaultPrecedent);
     setPatternIssueType({ label: `${issueType} only`, value: issueType });
     setRequiredLabel(firstLabel);
     setModalError('');
@@ -328,6 +329,15 @@ const IssuePanel = () => {
             {graphIssues.length}
           </Text>
 
+          {teamworkGraph?.issueNode?.key && (
+            <Text size="small" color="color.text.subtle">
+              Graph Node: {teamworkGraph.issueNode.key}
+              {teamworkGraph.issueNode.status?.name
+                ? ` (${teamworkGraph.issueNode.status.name})`
+                : ''}
+            </Text>
+          )}
+
           {graphPages.map((page) => (
             <Text key={page.id || page.url || page.title} size="small">
               Page:{' '}
@@ -433,6 +443,16 @@ const IssuePanel = () => {
                         {issueContext.labels?.length > 0 ? issueContext.labels.join(', ') : 'None'}.
                       </HelperMessage>
                     </Stack>
+
+                    {!requiredLabel.trim() && (
+                      <SectionMessage appearance="warning" title="Broad precedent scope">
+                        <Text>
+                          Leaving Required label blank will auto-exempt ALL future matching issues of
+                          this issue type without manual review. Add a specific label (for example,
+                          docs-only) unless you intentionally want a broad precedent.
+                        </Text>
+                      </SectionMessage>
+                    )}
                   </Stack>
                 )}
               </Stack>

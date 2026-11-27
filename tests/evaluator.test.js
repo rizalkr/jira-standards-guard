@@ -328,7 +328,7 @@ test('projectKeys scoping filters rules by project and supports Confluence PROJE
   assert.equal(payEval.verdict, 'BLOCKED');
 });
 
-test('fetchIssueTeamworkGraphContext handles ARI validation, APIResponse parsing, partial fallback, and HTTP errors', async () => {
+test('fetchIssueTeamworkGraphContext handles ARI validation, objects/hierarchy/linked-pages parsing, partial fallback, and HTTP errors', async () => {
   assert.equal(buildIssueAri('cloud-1', '10001'), 'ari:cloud:jira:cloud-1:issue/10001');
   assert.equal(buildConfluencePageAri('cloud-1', '983041'), 'ari:cloud:confluence:cloud-1:page/983041');
 
@@ -336,7 +336,11 @@ test('fetchIssueTeamworkGraphContext handles ARI validation, APIResponse parsing
   assert.equal(missingCloud.status, 'unavailable');
   assert.deepEqual(missingCloud.linkedPages, []);
 
-  // Normal + partial curated fallback: jiraWorkItemLinkedConfluencePages errors, confluencePage hydrates from URL.
+  const issueAri = 'ari:cloud:jira:cloud-1:issue/10002';
+  const pageAri = 'ari:cloud:confluence:cloud-1:page/983041';
+  const linkedIssueAri = 'ari:cloud:jira:cloud-1:issue/10001';
+
+  // Partial fallback: StandardsGuard_GetIssueHierarchy errors, objects(ids) hydrates issue/page/linked issue.
   const partialCtx = await fetchIssueTeamworkGraphContext({
     cloudId: 'cloud-1',
     issueId: '10002',
@@ -355,28 +359,50 @@ test('fetchIssueTeamworkGraphContext handles ARI validation, APIResponse parsing
     requester: async (_q, variables, op) => ({
       ok: true,
       json: async () => {
-        if (op === 'StandardsGuard_GetIssueContext') {
-          if (variables.id.endsWith('/10002')) {
-            return {
-              data: { jiraWorkItem: { id: variables.id, key: 'KAN-3', summary: 'Webhook retries' } },
-            };
-          }
+        if (op === 'StandardsGuard_GetObjects') {
+          assert.deepEqual(variables.ids, [issueAri, pageAri, linkedIssueAri]);
           return {
             data: {
-              jiraWorkItem: {
-                id: variables.id,
-                key: 'KAN-2',
-                summary: 'Checkout timeout',
-                status: { name: 'Blocked' },
-              },
+              objects: [
+                {
+                  id: issueAri,
+                  data: {
+                    __typename: 'JiraWorkItem',
+                    id: issueAri,
+                    key: 'KAN-3',
+                    summary: 'Webhook retries',
+                    status: { name: 'In Progress' },
+                  },
+                },
+                {
+                  id: pageAri,
+                  data: {
+                    __typename: 'ConfluencePage',
+                    id: pageAri,
+                    pageId: '983041',
+                    title: 'Engineering Standards',
+                    webUrl: 'https://rizalkurnia-me.atlassian.net/wiki/spaces/SD/pages/983041',
+                  },
+                },
+                {
+                  id: linkedIssueAri,
+                  data: {
+                    __typename: 'JiraWorkItem',
+                    id: linkedIssueAri,
+                    key: 'KAN-2',
+                    summary: 'Checkout timeout',
+                    status: { name: 'Blocked' },
+                  },
+                },
+              ],
             },
           };
         }
-        if (op === 'StandardsGuard_GetLinkedPages') {
-          return { errors: [{ message: 'Field unsupported on this tenant' }] };
+        if (op === 'StandardsGuard_GetIssueHierarchy') {
+          return { errors: [{ message: 'Hierarchy unavailable' }] };
         }
-        if (op === 'StandardsGuard_GetConfluencePage') {
-          return { data: { confluencePage: { id: variables.id, title: 'Engineering Standards' } } };
+        if (op === 'StandardsGuard_GetLinkedConfluencePages') {
+          return { data: { confluencePageLinkedConfluencePages: { edges: [] } } };
         }
         return { data: {} };
       },
@@ -384,11 +410,119 @@ test('fetchIssueTeamworkGraphContext handles ARI validation, APIResponse parsing
   });
 
   assert.equal(partialCtx.status, 'ok');
+  assert.equal(partialCtx.issueNode?.key, 'KAN-3');
   assert.equal(partialCtx.linkedPages.length, 1);
   assert.equal(partialCtx.linkedPages[0].title, 'Engineering Standards');
   assert.equal(partialCtx.relatedIssues.length, 1);
   assert.equal(partialCtx.relatedIssues[0].key, 'KAN-2');
   assert.equal(partialCtx.relatedIssues[0].hydratedByGraph, true);
+
+  // Hierarchy + secondary Confluence linked pages discovery and deduplication.
+  const graphRichCtx = await fetchIssueTeamworkGraphContext({
+    cloudId: 'cloud-1',
+    issueId: '10002',
+    issueKey: 'KAN-3',
+    descriptionUrls: ['https://rizalkurnia-me.atlassian.net/wiki/spaces/SD/pages/983041/Engineering+Standards'],
+    requester: async (_q, variables, op) => ({
+      ok: true,
+      json: async () => {
+        if (op === 'StandardsGuard_GetObjects') {
+          return {
+            data: {
+              objects: [
+                {
+                  id: issueAri,
+                  data: {
+                    __typename: 'JiraWorkItem',
+                    id: issueAri,
+                    key: 'KAN-3',
+                    summary: 'Webhook retries',
+                    status: { name: 'In Progress' },
+                  },
+                },
+                {
+                  id: pageAri,
+                  data: {
+                    __typename: 'ConfluencePage',
+                    id: pageAri,
+                    pageId: '983041',
+                    title: 'Engineering Standards',
+                    webUrl: 'https://rizalkurnia-me.atlassian.net/wiki/spaces/SD/pages/983041',
+                  },
+                },
+              ],
+            },
+          };
+        }
+        if (op === 'StandardsGuard_GetIssueHierarchy') {
+          return {
+            data: {
+              jiraWorkItemHierarchy: {
+                edges: [
+                  {
+                    node: {
+                      __typename: 'JiraWorkItem',
+                      id: issueAri,
+                      key: 'KAN-3',
+                      summary: 'Webhook retries',
+                    },
+                  },
+                  {
+                    node: {
+                      __typename: 'JiraWorkItem',
+                      id: 'ari:cloud:jira:cloud-1:issue/10009',
+                      key: 'KAN-9',
+                      summary: 'Epic parent reliability work',
+                      status: { name: 'In Progress' },
+                    },
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (op === 'StandardsGuard_GetLinkedConfluencePages') {
+          assert.equal(variables.id, pageAri);
+          return {
+            data: {
+              confluencePageLinkedConfluencePages: {
+                edges: [
+                  {
+                    node: {
+                      __typename: 'ConfluencePage',
+                      id: pageAri,
+                      pageId: '983041',
+                      title: 'Engineering Standards',
+                    },
+                  },
+                  {
+                    node: {
+                      __typename: 'ConfluencePage',
+                      id: 'ari:cloud:confluence:cloud-1:page/983042',
+                      pageId: '983042',
+                      title: 'Runbook Checklist',
+                      webUrl: 'https://rizalkurnia-me.atlassian.net/wiki/spaces/SD/pages/983042',
+                    },
+                  },
+                ],
+              },
+            },
+          };
+        }
+        return { data: {} };
+      },
+    }),
+  });
+
+  assert.equal(graphRichCtx.status, 'ok');
+  assert.deepEqual(
+    graphRichCtx.linkedPages.map((p) => p.pageId),
+    ['983041', '983042']
+  );
+  assert.deepEqual(
+    graphRichCtx.relatedIssues.map((i) => i.key),
+    ['KAN-9']
+  );
 
   // HTTP error returns degraded error status without throwing.
   const httpErrCtx = await fetchIssueTeamworkGraphContext({

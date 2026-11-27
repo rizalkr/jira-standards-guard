@@ -1,49 +1,82 @@
 import api from '@forge/api';
 import { extractConfluencePageId } from '../engine/evaluator.js';
 
-const ISSUE_CONTEXT_QUERY = `
-  query StandardsGuard_GetIssueContext($id: ID!) {
-    jiraWorkItem(id: $id) {
+const OBJECTS_HYDRATION_QUERY = `
+  query StandardsGuard_GetObjects($ids: [ID!]!) {
+    objects(ids: $ids) {
       id
-      key
-      summary
-      status {
-        name
-      }
-      issueType {
-        name
-      }
-      assignee {
-        name
-      }
-    }
-  }
-`;
-
-const LINKED_PAGES_QUERY = `
-  query StandardsGuard_GetLinkedPages($id: ID!, $first: Int) {
-    jiraWorkItemLinkedConfluencePages(id: $id, first: $first) {
-      edges {
-        node {
+      data {
+        __typename
+        ... on JiraWorkItem {
           id
+          key
+          summary
+          webUrl
+          status {
+            name
+          }
+          issueType {
+            name
+          }
+        }
+        ... on ConfluencePage {
+          id
+          pageId
           title
+          webUrl
         }
       }
     }
   }
 `;
 
-const CONFLUENCE_PAGE_QUERY = `
-  query StandardsGuard_GetConfluencePage($id: ID!) {
-    confluencePage(id: $id) {
-      id
-      title
+const ISSUE_HIERARCHY_QUERY = `
+  query StandardsGuard_GetIssueHierarchy($id: ID!, $first: Int) {
+    jiraWorkItemHierarchy(
+      id: $id
+      kinds: [PARENT, CHILD, BLOCKS, BLOCKED_BY, LINKED]
+      first: $first
+    ) {
+      edges {
+        node {
+          __typename
+          ... on JiraWorkItem {
+            id
+            key
+            summary
+            webUrl
+            status {
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const CONFLUENCE_LINKED_PAGES_QUERY = `
+  query StandardsGuard_GetLinkedConfluencePages($id: ID!, $first: Int) {
+    confluencePageLinkedConfluencePages(id: $id, first: $first) {
+      edges {
+        node {
+          __typename
+          ... on ConfluencePage {
+            id
+            pageId
+            title
+            webUrl
+          }
+        }
+      }
     }
   }
 `;
 
 const MAX_HYDRATED_ITEMS = 5;
 const MAX_GRAPH_ROWS = 20;
+const MAX_OBJECTS_BATCH = 25;
+const MAX_LINKED_PAGE_SEEDS = 2;
 
 /**
  * Builds an Atlassian Resource Identifier (ARI) for a Jira issue.
@@ -162,6 +195,14 @@ function collectLinkedIssues(issueLinks) {
   return [...byKey.values()].slice(0, MAX_HYDRATED_ITEMS);
 }
 
+function isJiraWorkItemData(data) {
+  return data?.__typename === 'JiraWorkItem' || Boolean(data?.key || data?.issueType);
+}
+
+function isConfluencePageData(data) {
+  return data?.__typename === 'ConfluencePage' || Boolean(data?.title || data?.pageId);
+}
+
 /**
  * Fetches Teamwork Graph context (issue node, connected Confluence pages, related Jira issues)
  * for a Jira issue via curated GraphQL queries with graceful fallback.
@@ -194,128 +235,188 @@ export async function fetchIssueTeamworkGraphContext({
     };
   }
 
-  const [issueRes, pagesRes] = await Promise.all([
+  const pageCandidates = collectConfluenceCandidates(remoteLinks, descriptionUrls).map(
+    (candidate) => ({
+      ...candidate,
+      pageAri: buildConfluencePageAri(cloudId, candidate.pageId),
+    })
+  );
+  const candidateByPageId = new Map(pageCandidates.map((c) => [c.pageId, c]));
+
+  const linkedIssueCandidates = collectLinkedIssues(issueLinks).map((candidate) => ({
+    ...candidate,
+    targetAri: buildIssueAri(cloudId, candidate.id),
+  }));
+  const candidateByIssueAri = new Map(
+    linkedIssueCandidates.filter((c) => c.targetAri).map((c) => [c.targetAri, c])
+  );
+  const candidateByIssueKey = new Map(
+    linkedIssueCandidates.filter((c) => c.key).map((c) => [c.key, c])
+  );
+
+  const batchIds = [
+    ...new Set(
+      [
+        issueAri,
+        ...pageCandidates.map((c) => c.pageAri),
+        ...linkedIssueCandidates.map((c) => c.targetAri),
+      ].filter(Boolean)
+    ),
+  ].slice(0, MAX_OBJECTS_BATCH);
+
+  const [objectsRes, hierarchyRes] = await Promise.all([
     executeTwgQuery(
       invokeGraph,
-      ISSUE_CONTEXT_QUERY,
-      { id: issueAri },
-      'StandardsGuard_GetIssueContext'
+      OBJECTS_HYDRATION_QUERY,
+      { ids: batchIds },
+      'StandardsGuard_GetObjects'
     ),
     executeTwgQuery(
       invokeGraph,
-      LINKED_PAGES_QUERY,
+      ISSUE_HIERARCHY_QUERY,
       { id: issueAri, first: MAX_GRAPH_ROWS },
-      'StandardsGuard_GetLinkedPages'
+      'StandardsGuard_GetIssueHierarchy'
     ),
   ]);
 
-  const issueNode = issueRes.data?.jiraWorkItem || null;
-  const pageCandidates = collectConfluenceCandidates(remoteLinks, descriptionUrls);
-  const candidateByPageId = new Map(pageCandidates.map((c) => [c.pageId, c]));
-
+  let issueNode = null;
   const pageMap = new Map();
-  const seenPageIds = new Set();
+  const relatedIssueMap = new Map();
 
-  const rawEdges = pagesRes.data?.jiraWorkItemLinkedConfluencePages?.edges;
-  for (const edge of Array.isArray(rawEdges) ? rawEdges : []) {
+  for (const entry of Array.isArray(objectsRes.data?.objects) ? objectsRes.data.objects : []) {
+    const data = entry?.data;
+    if (!data) continue;
+
+    if (isJiraWorkItemData(data)) {
+      const nodeId = data.id || entry.id || '';
+      const nodeKey = String(data.key || '').trim();
+      const isCurrentIssue =
+        entry.id === issueAri || nodeId === issueAri || (Boolean(issueKey) && nodeKey === issueKey);
+
+      if (isCurrentIssue) {
+        issueNode = data;
+        continue;
+      }
+
+      const matchingCandidate =
+        candidateByIssueAri.get(entry.id) ||
+        candidateByIssueAri.get(nodeId) ||
+        (nodeKey ? candidateByIssueKey.get(nodeKey) : null);
+      const dedupeKey = nodeKey || nodeId || entry.id;
+      if (!dedupeKey || relatedIssueMap.has(dedupeKey)) continue;
+
+      relatedIssueMap.set(dedupeKey, {
+        id: nodeId || matchingCandidate?.id || '',
+        key: nodeKey || matchingCandidate?.key || '',
+        summary: data.summary || matchingCandidate?.summary || '',
+        status: data.status?.name || matchingCandidate?.status || '',
+        relationship: matchingCandidate?.relationship || 'related',
+        url: data.webUrl || '',
+        hydratedByGraph: true,
+      });
+      continue;
+    }
+
+    if (isConfluencePageData(data)) {
+      const nodeId = data.id || entry.id || '';
+      const pageId = String(data.pageId || extractPageIdFromAri(nodeId) || '').trim();
+      const matchingCandidate = pageId ? candidateByPageId.get(pageId) : null;
+      const dedupeKey = pageId || nodeId || matchingCandidate?.url;
+      if (!dedupeKey || pageMap.has(dedupeKey)) continue;
+
+      pageMap.set(dedupeKey, {
+        id: nodeId,
+        pageId,
+        title:
+          data.title ||
+          matchingCandidate?.title ||
+          (pageId ? `Confluence Page ${pageId}` : 'Confluence Page'),
+        url: data.webUrl || matchingCandidate?.url || '',
+        source: 'teamwork-graph',
+      });
+    }
+  }
+
+  const hierarchyEdges = hierarchyRes.data?.jiraWorkItemHierarchy?.edges;
+  for (const edge of Array.isArray(hierarchyEdges) ? hierarchyEdges : []) {
     const node = edge?.node;
-    if (!node?.id && !node?.title) continue;
-    const pageId = extractPageIdFromAri(node.id);
-    if (pageId) seenPageIds.add(pageId);
-    const matchingCandidate = pageId ? candidateByPageId.get(pageId) : null;
-    const dedupeKey = node.id || matchingCandidate?.url || node.title;
-    if (!dedupeKey || pageMap.has(dedupeKey)) continue;
+    if (!node || (!node.id && !node.key)) continue;
+    const nodeKey = String(node.key || '').trim();
+    const isCurrentIssue = node.id === issueAri || (Boolean(issueKey) && nodeKey === issueKey);
+    if (isCurrentIssue) continue;
 
-    pageMap.set(dedupeKey, {
+    const dedupeKey = nodeKey || node.id;
+    if (!dedupeKey || relatedIssueMap.has(dedupeKey)) continue;
+
+    relatedIssueMap.set(dedupeKey, {
       id: node.id || '',
-      pageId,
-      title: node.title || matchingCandidate?.title || 'Confluence Page',
-      url: matchingCandidate?.url || '',
-      source: 'teamwork-graph',
+      key: nodeKey,
+      summary: node.summary || '',
+      status: node.status?.name || '',
+      relationship: 'hierarchy',
+      url: node.webUrl || '',
+      hydratedByGraph: true,
     });
   }
 
-  const missingCandidates = pageCandidates.filter((c) => !seenPageIds.has(c.pageId));
-  let hydratedPageOk = false;
-  if (missingCandidates.length > 0) {
-    const pageResults = await Promise.allSettled(
-      missingCandidates.map(async (candidate) => {
-        const pageAri = buildConfluencePageAri(cloudId, candidate.pageId);
-        if (!pageAri) return null;
-        const res = await executeTwgQuery(
+  for (const candidate of linkedIssueCandidates) {
+    const dedupeKey = candidate.key || candidate.targetAri || candidate.id;
+    if (!dedupeKey || relatedIssueMap.has(dedupeKey)) continue;
+
+    relatedIssueMap.set(dedupeKey, {
+      id: candidate.targetAri || candidate.id,
+      key: candidate.key,
+      summary: candidate.summary,
+      status: candidate.status,
+      relationship: candidate.relationship,
+      url: '',
+      hydratedByGraph: false,
+    });
+  }
+
+  let linkedPagesOk = false;
+  const seedPageAris = pageCandidates
+    .map((c) => c.pageAri)
+    .filter(Boolean)
+    .slice(0, MAX_LINKED_PAGE_SEEDS);
+
+  if (seedPageAris.length > 0) {
+    const linkedPageResults = await Promise.allSettled(
+      seedPageAris.map((pageAri) =>
+        executeTwgQuery(
           invokeGraph,
-          CONFLUENCE_PAGE_QUERY,
-          { id: pageAri },
-          'StandardsGuard_GetConfluencePage'
-        );
-        return { candidate, pageAri, res };
-      })
+          CONFLUENCE_LINKED_PAGES_QUERY,
+          { id: pageAri, first: MAX_GRAPH_ROWS },
+          'StandardsGuard_GetLinkedConfluencePages'
+        )
+      )
     );
 
-    for (const settled of pageResults) {
+    for (const settled of linkedPageResults) {
       if (settled.status !== 'fulfilled' || !settled.value) continue;
-      const { candidate, pageAri, res } = settled.value;
-      if (res.ok) hydratedPageOk = true;
-      const node = res.data?.confluencePage;
-      if (!node) continue;
+      const res = settled.value;
+      if (res.ok) linkedPagesOk = true;
+      const edges = res.data?.confluencePageLinkedConfluencePages?.edges;
+      for (const edge of Array.isArray(edges) ? edges : []) {
+        const node = edge?.node;
+        if (!node || (!node.id && !node.title && !node.pageId)) continue;
+        const pageId = String(node.pageId || extractPageIdFromAri(node.id) || '').trim();
+        const dedupeKey = pageId || node.id || node.webUrl || node.title;
+        if (!dedupeKey || pageMap.has(dedupeKey)) continue;
 
-      const id = node.id || pageAri;
-      const dedupeKey = id || candidate.url;
-      if (!pageMap.has(dedupeKey)) {
         pageMap.set(dedupeKey, {
-          id,
-          pageId: candidate.pageId,
-          title: node.title || candidate.title || `Confluence Page ${candidate.pageId}`,
-          url: candidate.url || '',
-          source: 'teamwork-graph',
+          id: node.id || '',
+          pageId,
+          title: node.title || (pageId ? `Confluence Page ${pageId}` : 'Confluence Page'),
+          url: node.webUrl || '',
+          source: 'teamwork-graph-linked',
         });
       }
     }
   }
 
-  const linkedIssueCandidates = collectLinkedIssues(issueLinks);
-  const relatedIssueMap = new Map();
-  let hydratedIssueOk = false;
-
-  if (linkedIssueCandidates.length > 0) {
-    const issueResults = await Promise.allSettled(
-      linkedIssueCandidates.map(async (candidate) => {
-        const targetAri = buildIssueAri(cloudId, candidate.id);
-        if (!targetAri) {
-          return { candidate, targetAri: '', res: null };
-        }
-        const res = await executeTwgQuery(
-          invokeGraph,
-          ISSUE_CONTEXT_QUERY,
-          { id: targetAri },
-          'StandardsGuard_GetIssueContext'
-        );
-        return { candidate, targetAri, res };
-      })
-    );
-
-    for (const settled of issueResults) {
-      if (settled.status !== 'fulfilled' || !settled.value) continue;
-      const { candidate, targetAri, res } = settled.value;
-      if (res?.ok) hydratedIssueOk = true;
-      const node = res?.data?.jiraWorkItem || null;
-      const key = node?.key || candidate.key;
-      const dedupeKey = key || node?.id || targetAri || candidate.id;
-      if (!dedupeKey || relatedIssueMap.has(dedupeKey)) continue;
-
-      relatedIssueMap.set(dedupeKey, {
-        id: node?.id || targetAri || candidate.id,
-        key,
-        summary: node?.summary || candidate.summary,
-        status: node?.status?.name || candidate.status,
-        relationship: candidate.relationship,
-        hydratedByGraph: Boolean(node),
-      });
-    }
-  }
-
-  const anyQueryOk = Boolean(issueNode) || issueRes.ok || pagesRes.ok || hydratedPageOk || hydratedIssueOk;
-  const errorMessages = [issueRes.error, pagesRes.error].filter(Boolean);
+  const anyQueryOk = Boolean(issueNode) || objectsRes.ok || hierarchyRes.ok || linkedPagesOk;
+  const errorMessages = [objectsRes.error, hierarchyRes.error].filter(Boolean);
   const errorDetail = [...new Set(errorMessages)].join(' | ');
 
   if (!anyQueryOk && errorDetail) {
