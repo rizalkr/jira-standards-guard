@@ -1,0 +1,76 @@
+modules:
+  jira:issuePanel:
+    - key: standards-guard-issue-panel
+      resource: issue-panel-ui
+      render: native
+      resolver:
+        function: resolver
+      viewportSize: medium
+      title: Jira Standards Guard
+      icon: https://developer.atlassian.com/platform/forge/images/issue-panel-icon.svg
+  jira:adminPage:
+    - key: standards-guard-admin-page
+      resource: admin-page-ui
+      render: native
+      resolver:
+        function: resolver
+      title: Jira Standards Guard
+  rovo:mcp:
+    - key: standards-guard-mcp
+      name: Jira Standards Guard MCP
+      tools:
+        - standards-guard-ping
+  rovo:agent:
+    - key: standards-guard-agent
+      name: Standards Guard
+      description: Evaluates Jira issues against team standards and approved exception precedents.
+      prompt: |
+        You are Jira Standards Guard, an engineering governance assistant.
+        Use the available actions to inspect issue readiness against team standards and report factual results with citations.
+      conversationStarters:
+        - Check standards readiness for this issue
+      actions:
+        - standards-guard-ping
+  action:
+    - key: standards-guard-ping
+      name: Check Standards Guard Health
+      function: action-handler
+      actionVerb: GET
+      description: Verifies Jira Standards Guard connectivity and returns status for an optional Jira issue key.
+      inputs:
+        issueKey:
+          title: Issue Key
+          type: string
+          required: false
+          description: Optional Jira issue key to inspect (e.g. KAN-1).
+  function:
+    - key: resolver
+      handler: index.handler
+    - key: action-handler
+      handler: index.pingAction
+resources:
+  - key: issue-panel-ui
+    path: src/frontend/issue-panel.jsx
+  - key: admin-page-ui
+    path: src/frontend/admin-page.jsx
+permissions:
+  scopes:
+    - read:jira-work
+    - storage:app
+    - read:graph:issue:jira
+    - read:graph:page:confluence
+    - read:graph:user:atlassian
+app:
+  rovo:
+    tag: stdguard
+    description: Evaluates Jira issues against team standards and approved exception precedents.
+    keywords:
+      - jira
+      - standards
+      - governance
+      - compliance
+  runtime:
+    name: nodejs24.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/3a0f7de7-98d2-4fab-a6df-d56828309f9a
