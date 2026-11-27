@@ -50,5 +50,5 @@ Updates to this Privacy Policy will be published directly in this document with 
 ## 8. Contact
 
 - **Developer:** Rizal Kurnia
-- **Email:** `klontongrizal@gmail.com`
+- **Email:** `rizalkurnia.me@gmail.com`
 - **Support & Privacy Requests:** `https://github.com/rizalkr/jira-standards-guard/issues`
